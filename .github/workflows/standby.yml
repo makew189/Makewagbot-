@@ -1,0 +1,68 @@
+name: standby-bot
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # cek tiap ~5 menit (GitHub bisa menunda)
+  workflow_dispatch:
+
+# hanya satu run pada satu waktu
+concurrency:
+  group: bot-standby
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write   # agar job bisa menyambung dirinya sendiri
+
+jobs:
+  standby:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cek apakah HP masih aktif
+        id: check
+        env:
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          HA_GIST_ID: ${{ secrets.HA_GIST_ID }}
+        run: python3 ha_check.py
+
+      - uses: actions/setup-python@v5
+        if: steps.check.outputs.standby == 'true'
+        with:
+          python-version: "3.12"
+
+      - name: Pasang dependensi
+        if: steps.check.outputs.standby == 'true'
+        run: pip install -r requirements.txt
+
+      - name: Jalankan bot (cadangan)
+        id: bot
+        if: steps.check.outputs.standby == 'true'
+        env:
+          NODE_ROLE: github
+          DB_PATH: /tmp/bot.db
+          HOST_MAX_SECONDS: "19800"   # 5 jam 30 menit
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          ALLOWED_USER_IDS: ${{ secrets.ALLOWED_USER_IDS }}
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          HA_GIST_ID: ${{ secrets.HA_GIST_ID }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.MODELS_TOKEN }}
+        run: |
+          set +e
+          python bot.py
+          echo "code=$?" >> "$GITHUB_OUTPUT"
+
+      # kode 0 = batas waktu job tercapai -> sambung ke run baru
+      - name: Sambung ke run berikutnya
+        if: steps.bot.outputs.code == '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run standby.yml
