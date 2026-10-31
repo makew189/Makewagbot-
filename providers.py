@@ -134,10 +134,13 @@ class Router:
                                 p["model"] = new
                                 continue
                         raise RuntimeError(f"HTTP {r.status_code}: {r.text[:100]}")
-                    text = r.json()["choices"][0]["message"]["content"]
+                    data = r.json()
+                    text = data["choices"][0]["message"]["content"]
                     if not text:
                         raise RuntimeError("respons kosong")
-                    return text.strip(), p["name"]
+                    # nama model yang benar-benar dipakai (router seperti OpenRouter bisa memilih sendiri)
+                    used_model = data.get("model") or override or p["model"]
+                    return text.strip(), f"{p['name']} · {used_model}"
                 except Exception as e:
                     log.warning("%s gagal: %s", p["name"], e)
                     p["down_until"] = time.time() + COOLDOWN

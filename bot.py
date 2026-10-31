@@ -372,7 +372,7 @@ HANDOFF_WAIT = int(os.getenv("HA_HANDOFF_WAIT", "30"))
 MAX_SECONDS = int(os.getenv("HOST_MAX_SECONDS", "0"))  # 0 = tanpa batas (HP)
 
 
-def ha_startup() -> bool:
+def _ha_startup() -> bool:
     """True = lanjut jalan. False = node ini harus standby/keluar."""
     if not ha.ENABLED:
         return True
@@ -403,6 +403,18 @@ def ha_startup() -> bool:
     if state.get("by") == "github" and state.get("data"):
         db.import_state(state["data"])
     return True
+
+
+def ha_startup() -> bool:
+    if not ha.ENABLED:
+        return True
+    try:
+        return _ha_startup()
+    except Exception as e:
+        logging.warning(
+            "HA gagal (%s). Periksa GIST_TOKEN (klasik, scope gist) dan HA_GIST_ID. %s", e,
+            "Bot HP tetap jalan tanpa failover." if ha.ROLE == "phone" else "GitHub tidak jalan.")
+        return ha.ROLE == "phone"
 
 
 def _snapshot():
@@ -440,8 +452,8 @@ async def ha_loop(app):
             snap, h = _snapshot()
             await asyncio.to_thread(ha.write, role, snap if h != last_hash else None, role)
             last_hash = h
-        except Exception:
-            logging.exception("ha_loop")
+        except Exception as e:
+            logging.warning("ha_loop: %s", e)
 
 
 async def on_error(update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -449,6 +461,13 @@ async def on_error(update, ctx: ContextTypes.DEFAULT_TYPE):
         logging.warning("Conflict: ada instance lain yang polling (menunggu serah-terima)")
         return
     logging.error("Error: %s", ctx.error)
+
+
+async def post_shutdown(app):
+    for k in ("reminder_task", "ha_task"):
+        t = app.bot_data.get(k)
+        if t:
+            t.cancel()
 
 
 async def post_init(app):
@@ -460,7 +479,7 @@ async def post_init(app):
 def main():
     if not ha_startup():
         sys.exit(11)
-    app = ApplicationBuilder().token(os.environ["TELEGRAM_BOT_TOKEN"]).post_init(post_init).build()
+    app = ApplicationBuilder().token(os.environ["TELEGRAM_BOT_TOKEN"]).post_init(post_init).post_shutdown(post_shutdown).build()
     app.add_error_handler(on_error)
     for name, fn in [("start", start), ("help", start), ("id", id_cmd), ("reset", reset),
                      ("agent", agent_cmd), ("use", use_cmd), ("providers", providers_cmd),
