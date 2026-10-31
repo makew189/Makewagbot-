@@ -20,8 +20,16 @@ CREATE TABLE IF NOT EXISTS reminders(
 CREATE TABLE IF NOT EXISTS prefs(
   uid INTEGER PRIMARY KEY, agent INTEGER DEFAULT 1, provider TEXT);
 """)
+_conn.executescript("""
+CREATE TABLE IF NOT EXISTS signals(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, uid INTEGER, sym TEXT, strat TEXT, direction TEXT,
+  tf TEXT, entry REAL, stop REAL, tp REAL, sig_t INTEGER, status TEXT DEFAULT 'open',
+  exit_px REAL, exit_t INTEGER, r REAL,
+  UNIQUE(uid, sym, strat, direction, tf, sig_t));
+""")
 _conn.commit()
-for _col in ("model TEXT", "equity REAL", "risk_pct REAL"):  # migrasi kolom baru
+for _col in ("model TEXT", "equity REAL", "risk_pct REAL",
+             "daily_time TEXT", "daily_chat INTEGER", "last_daily TEXT"):  # migrasi kolom baru
     try:
         _conn.execute(f"ALTER TABLE prefs ADD COLUMN {_col}")
         _conn.commit()
@@ -107,15 +115,55 @@ def advance_or_delete(r, now):
 # ---------- preferensi ----------
 def get_prefs(uid):
     _run("INSERT OR IGNORE INTO prefs(uid) VALUES(?)", (uid,))
-    r = _run("SELECT agent, provider, model, equity, risk_pct FROM prefs WHERE uid=?",
-             (uid,)).fetchone()
+    r = _run("SELECT * FROM prefs WHERE uid=?", (uid,)).fetchone()
     return {"agent": bool(r["agent"]), "provider": r["provider"], "model": r["model"],
-            "equity": r["equity"], "risk_pct": r["risk_pct"]}
+            "equity": r["equity"], "risk_pct": r["risk_pct"],
+            "daily_time": r["daily_time"], "last_daily": r["last_daily"]}
 
 
 def set_agent(uid, on):
     get_prefs(uid)
     _run("UPDATE prefs SET agent=? WHERE uid=?", (1 if on else 0, uid))
+
+
+def set_daily(uid, hhmm, chat_id=None):
+    get_prefs(uid)
+    _run("UPDATE prefs SET daily_time=?, daily_chat=? WHERE uid=?", (hhmm, chat_id, uid))
+
+
+def mark_daily(uid, day):
+    _run("UPDATE prefs SET last_daily=? WHERE uid=?", (day, uid))
+
+
+def daily_users():
+    return _run("SELECT uid, daily_time, daily_chat, last_daily FROM prefs "
+                "WHERE daily_time IS NOT NULL AND daily_chat IS NOT NULL").fetchall()
+
+
+# ---------- pelacak sinyal ----------
+def add_signal(uid, sym, strat, direction, tf, entry, stop, tp, sig_t):
+    return _run("INSERT OR IGNORE INTO signals(uid,sym,strat,direction,tf,entry,stop,tp,sig_t) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
+                (uid, sym, strat, direction, tf, entry, stop, tp, sig_t)).rowcount > 0
+
+
+def open_signals():
+    return _run("SELECT * FROM signals WHERE status='open'").fetchall()
+
+
+def close_signal(sid, status, exit_px, exit_t, r):
+    _run("UPDATE signals SET status=?, exit_px=?, exit_t=?, r=? WHERE id=?",
+         (status, exit_px, exit_t, r, sid))
+
+
+def resolved_signals(uid):
+    return _run("SELECT * FROM signals WHERE uid=? AND status IN ('tp','sl','exp') "
+                "ORDER BY exit_t DESC", (uid,)).fetchall()
+
+
+def open_count(uid):
+    return _run("SELECT COUNT(*) c FROM signals WHERE uid=? AND status='open'",
+                (uid,)).fetchone()["c"]
 
 
 def set_risk(uid, equity, risk_pct):
@@ -135,7 +183,9 @@ def export_state():
         "facts": [dict(r) for r in _run("SELECT id,uid,fact,ts FROM facts").fetchall()],
         "reminders": [dict(r) for r in _run(
             "SELECT id,uid,chat_id,text,due,repeat FROM reminders").fetchall()],
-        "prefs": [dict(r) for r in _run("SELECT uid,agent,provider,model,equity,risk_pct FROM prefs").fetchall()],
+        "signals": [dict(r) for r in _run(
+            "SELECT * FROM signals ORDER BY id DESC LIMIT 300").fetchall()],
+        "prefs": [dict(r) for r in _run("SELECT uid,agent,provider,model,equity,risk_pct,daily_time,daily_chat,last_daily FROM prefs").fetchall()],
     }
 
 
@@ -150,6 +200,13 @@ def import_state(s):
             "INSERT INTO reminders(id,uid,chat_id,text,due,repeat) "
             "VALUES(:id,:uid,:chat_id,:text,:due,:repeat)", s.get("reminders", []))
         _conn.executemany(
-            "INSERT INTO prefs(uid,agent,provider,model,equity,risk_pct) "
-            "VALUES(:uid,:agent,:provider,:model,:equity,:risk_pct)",
-            [{"model": None, "equity": None, "risk_pct": None, **p} for p in s.get("prefs", [])])
+            "INSERT INTO prefs(uid,agent,provider,model,equity,risk_pct,daily_time,daily_chat,last_daily) "
+            "VALUES(:uid,:agent,:provider,:model,:equity,:risk_pct,:daily_time,:daily_chat,:last_daily)",
+            [{"model": None, "equity": None, "risk_pct": None, "daily_time": None,
+              "daily_chat": None, "last_daily": None, **p} for p in s.get("prefs", [])])
+        if "signals" in s:  # snapshot lama tanpa kunci ini tidak menghapus data lokal
+            _conn.execute("DELETE FROM signals")
+            _conn.executemany(
+                "INSERT INTO signals(id,uid,sym,strat,direction,tf,entry,stop,tp,sig_t,status,"
+                "exit_px,exit_t,r) VALUES(:id,:uid,:sym,:strat,:direction,:tf,:entry,:stop,:tp,"
+                ":sig_t,:status,:exit_px,:exit_t,:r)", s["signals"])

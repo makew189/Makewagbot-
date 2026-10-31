@@ -7,6 +7,7 @@ import logging
 import os
 import sys
 import time
+from datetime import datetime
 
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -20,6 +21,7 @@ load_dotenv()
 import db  # noqa: E402
 import ha  # noqa: E402
 import scanner  # noqa: E402
+import tracker  # noqa: E402
 from agent import basic_system, run_agent  # noqa: E402
 from providers import Router  # noqa: E402
 from tools import fmt_ts  # noqa: E402
@@ -44,6 +46,8 @@ HELP = (
     "/providers – status provider\n"
     "/scan [1d|4h] – pindai koin: sinyal + SL/TP + ukuran posisi\n"
     "/risk <modal USDT> <persen> – atur modal & risiko per trade\n"
+    "/hasil – akurasi asli sinyal yang pernah dicatat\n"
+    "/harian <JJ:MM|off> – laporan pindai otomatis tiap hari (WIB)\n"
     "/memory – lihat memori jangka panjang\n"
     "/forget <id|all> – hapus memori\n"
     "/reminders – lihat pengingat\n"
@@ -263,12 +267,53 @@ async def scan_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logging.exception("scan gagal")
         return await msg.edit_text(f"⚠️ {e}")
-    p = db.get_prefs(update.effective_user.id)
+    uid = update.effective_user.id
+    p = db.get_prefs(uid)
+    added = tracker.record(uid, data)
     try:
         await msg.delete()
     except Exception:
         pass
-    await send_long(update, scanner.format_scan(data, p["equity"], p["risk_pct"]))
+    text = scanner.format_scan(data, p["equity"], p["risk_pct"])
+    if added:
+        text += f"\n\n📝 {added} sinyal dicatat di /hasil untuk dilacak."
+    await send_long(update, text)
+
+
+async def hasil_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
+        return
+    await typing(update, ctx)
+    try:
+        await tracker.update_open()
+    except Exception as e:
+        logging.warning("update_open: %s", e)
+    await send_long(update, tracker.report(update.effective_user.id))
+
+
+async def harian_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
+        return
+    uid = update.effective_user.id
+    arg = (ctx.args[0].lower() if ctx.args else "")
+    if not arg:
+        t = db.get_prefs(uid)["daily_time"]
+        return await update.message.reply_text(
+            f"Laporan harian: {t + ' WIB' if t else 'mati'}\n"
+            "Atur: /harian 07:15 · Matikan: /harian off\n"
+            "Candle harian tutup 07:00 WIB, jadi pilih ≥07:05.")
+    if arg == "off":
+        db.set_daily(uid, None, None)
+        return await update.message.reply_text("Laporan harian dimatikan ✅")
+    try:
+        h, m = (int(x) for x in arg.split(":"))
+        assert 0 <= h < 24 and 0 <= m < 60
+    except Exception:
+        return await update.message.reply_text("Format jam: JJ:MM, contoh /harian 07:15")
+    hhmm = f"{h:02d}:{m:02d}"
+    db.set_daily(uid, hhmm, update.effective_chat.id)
+    warn = "\n⚠️ Sebelum 07:05 WIB candle harian belum tutup (data kemarin)." if hhmm < "07:05" else ""
+    await update.message.reply_text(f"✅ Laporan pindai harian tiap {hhmm} WIB.{warn}")
 
 
 async def risk_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -510,8 +555,39 @@ async def on_error(update, ctx: ContextTypes.DEFAULT_TYPE):
     logging.error("Error: %s", ctx.error)
 
 
+async def daily_loop(app):
+    last_try = {}
+    while True:
+        try:
+            now = datetime.now(scanner.WIB)
+            today = now.strftime("%Y-%m-%d")
+            for u in db.daily_users():
+                uid = u["uid"]
+                if not tracker.is_due(u["daily_time"], now, u["last_daily"]):
+                    continue
+                if time.time() - last_try.get(uid, 0) < 900:   # gagal? coba lagi tiap 15 menit
+                    continue
+                last_try[uid] = time.time()
+                try:
+                    await tracker.update_open()
+                    data = await scanner.run_scan("1d")
+                    tracker.record(uid, data)
+                    p = db.get_prefs(uid)
+                    text = ("🌅 Laporan harian\n\n"
+                            + scanner.format_scan(data, p["equity"], p["risk_pct"])
+                            + "\n\n" + tracker.summary(uid))
+                    for i in range(0, len(text), 4000):
+                        await app.bot.send_message(u["daily_chat"], text[i:i + 4000])
+                    db.mark_daily(uid, today)
+                except Exception:
+                    logging.exception("laporan harian gagal (uid %s)", uid)
+        except Exception:
+            logging.exception("daily_loop")
+        await asyncio.sleep(60)
+
+
 async def post_shutdown(app):
-    for k in ("reminder_task", "ha_task"):
+    for k in ("reminder_task", "ha_task", "daily_task"):
         t = app.bot_data.get(k)
         if t:
             t.cancel()
@@ -519,6 +595,7 @@ async def post_shutdown(app):
 
 async def post_init(app):
     app.bot_data["reminder_task"] = asyncio.create_task(reminder_loop(app))
+    app.bot_data["daily_task"] = asyncio.create_task(daily_loop(app))
     if ha.ENABLED:
         app.bot_data["ha_task"] = asyncio.create_task(ha_loop(app))
 
@@ -532,7 +609,8 @@ def main():
                      ("agent", agent_cmd), ("use", use_cmd), ("providers", providers_cmd),
                      ("memory", memory_cmd), ("forget", forget_cmd), ("reminders", reminders_cmd),
                      ("models", models_cmd), ("model", model_cmd),
-                     ("scan", scan_cmd), ("risk", risk_cmd)]:
+                     ("scan", scan_cmd), ("risk", risk_cmd),
+                     ("hasil", hasil_cmd), ("harian", harian_cmd)]:
         app.add_handler(CommandHandler(name, fn))
     app.add_handler(CallbackQueryHandler(on_choice))
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
