@@ -19,6 +19,7 @@ load_dotenv()
 
 import db  # noqa: E402
 import ha  # noqa: E402
+import scanner  # noqa: E402
 from agent import basic_system, run_agent  # noqa: E402
 from providers import Router  # noqa: E402
 from tools import fmt_ts  # noqa: E402
@@ -41,6 +42,8 @@ HELP = (
     "/model <provider> <id> – pilih model manual\n"
     "/use <provider|auto> – pilih provider saja\n"
     "/providers – status provider\n"
+    "/scan [1d|4h] – pindai koin: sinyal + SL/TP + ukuran posisi\n"
+    "/risk <modal USDT> <persen> – atur modal & risiko per trade\n"
     "/memory – lihat memori jangka panjang\n"
     "/forget <id|all> – hapus memori\n"
     "/reminders – lihat pengingat\n"
@@ -245,6 +248,50 @@ async def on_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     total = (len(ids) - 1) // PAGE + 1
     await q.edit_message_text(f"{name}: {len(ids)} model (hal {page + 1}/{total})\nPilih:",
                               reply_markup=_models_kb(name, ids, page))
+
+
+# ---------------- pemindai koin ----------------
+async def scan_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
+        return
+    tf = (ctx.args[0].lower() if ctx.args else "1d")
+    if tf not in ("1d", "4h"):
+        return await update.message.reply_text("Pakai: /scan (harian) atau /scan 4h")
+    msg = await update.message.reply_text("🔎 Memindai koin, tunggu ±20–40 detik...")
+    try:
+        data = await scanner.run_scan(tf)
+    except Exception as e:
+        logging.exception("scan gagal")
+        return await msg.edit_text(f"⚠️ {e}")
+    p = db.get_prefs(update.effective_user.id)
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+    await send_long(update, scanner.format_scan(data, p["equity"], p["risk_pct"]))
+
+
+async def risk_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
+        return
+    uid = update.effective_user.id
+    if not ctx.args:
+        p = db.get_prefs(uid)
+        if p["equity"] and p["risk_pct"]:
+            return await update.message.reply_text(
+                f"Modal: {p['equity']:g} USDT · risiko {p['risk_pct']:g}% per trade "
+                f"(= {p['equity'] * p['risk_pct'] / 100:.2f} USDT)\nUbah: /risk 500 1")
+        return await update.message.reply_text("Belum diatur. Contoh: /risk 500 1 (modal 500 USDT, risiko 1%)")
+    try:
+        equity, pct = float(ctx.args[0].replace(",", ".")), float(ctx.args[1].replace(",", "."))
+    except (ValueError, IndexError):
+        return await update.message.reply_text("Pakai: /risk <modal USDT> <persen>. Contoh: /risk 500 1")
+    if equity <= 0 or not (0.1 <= pct <= 2):
+        return await update.message.reply_text(
+            "Modal harus > 0 dan risiko per trade dibatasi 0.1–2% demi keamanan.")
+    db.set_risk(uid, equity, pct)
+    await update.message.reply_text(
+        f"✅ Modal {equity:g} USDT, risiko {pct:g}% per trade (= {equity * pct / 100:.2f} USDT)")
 
 
 # ---------------- pesan teks (agent / chat) ----------------
@@ -484,7 +531,8 @@ def main():
     for name, fn in [("start", start), ("help", start), ("id", id_cmd), ("reset", reset),
                      ("agent", agent_cmd), ("use", use_cmd), ("providers", providers_cmd),
                      ("memory", memory_cmd), ("forget", forget_cmd), ("reminders", reminders_cmd),
-                     ("models", models_cmd), ("model", model_cmd)]:
+                     ("models", models_cmd), ("model", model_cmd),
+                     ("scan", scan_cmd), ("risk", risk_cmd)]:
         app.add_handler(CommandHandler(name, fn))
     app.add_handler(CallbackQueryHandler(on_choice))
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))

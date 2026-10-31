@@ -33,6 +33,8 @@ ATURAN FORMAT:
 - Obrolan biasa atau pertanyaan umum: langsung jawab dengan final.
 - Gunakan tool hanya bila perlu (info terbaru, hitungan, baca link, pengingat, memori).
 - Pengingat: hitung waktu dari "Waktu sekarang". Pakai in_minutes untuk "X menit/jam lagi" (jam x 60).
+- DILARANG menyebut sinyal trading, rekomendasi beli/jual, atau harga koin dari ingatan.
+  Untuk mencari koin/sinyal WAJIB panggil scan_market; untuk harga pakai web_search.
 - Panggil remember bila pengguna minta "ingat ..." atau menyebut info pribadi yang berguna
   jangka panjang (nama, kebiasaan, proyek). JANGAN simpan password, API key, atau data sensitif."""
 

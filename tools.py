@@ -152,6 +152,16 @@ async def delete_reminder(args, ctx):
     return "Pengingat dihapus." if db.del_reminder(ctx["uid"], rid) else "Id tidak ditemukan."
 
 
+async def scan_market(args, ctx):
+    import scanner
+    tf = str(args.get("timeframe", "1d")).lower()
+    if tf not in ("1d", "4h"):
+        tf = "1d"
+    data = await scanner.run_scan(tf)
+    p = db.get_prefs(ctx["uid"])
+    return scanner.format_scan(data, p["equity"], p["risk_pct"])
+
+
 TOOLS = {
     "web_search": (web_search, 'Cari info terbaru di internet. args: {"query": "..."}'),
     "fetch_url": (fetch_url, 'Baca teks sebuah halaman web. args: {"url": "..."}'),
@@ -162,6 +172,10 @@ TOOLS = {
     "set_reminder": (set_reminder,
                      'Buat pengingat. args: {"text": "...", "in_minutes": 30} ATAU '
                      '{"text": "...", "time": "YYYY-MM-DD HH:MM"} (WIB); opsional "repeat": "daily"|"weekly"'),
+    "scan_market": (scan_market,
+                    'Pindai koin kripto (data nyata + uji historis + hitungan risiko). '
+                    'args: {"timeframe": "1d"|"4h"}. Hasilnya sudah final: salin APA ADANYA, '
+                    'jangan ubah angka.'),
     "list_reminders": (list_reminders, "Lihat semua pengingat aktif. args: {}"),
     "delete_reminder": (delete_reminder, 'Hapus pengingat. args: {"id": 2}'),
 }

@@ -21,11 +21,12 @@ CREATE TABLE IF NOT EXISTS prefs(
   uid INTEGER PRIMARY KEY, agent INTEGER DEFAULT 1, provider TEXT);
 """)
 _conn.commit()
-try:  # migrasi: kolom model pilihan pengguna
-    _conn.execute("ALTER TABLE prefs ADD COLUMN model TEXT")
-    _conn.commit()
-except sqlite3.OperationalError:
-    pass
+for _col in ("model TEXT", "equity REAL", "risk_pct REAL"):  # migrasi kolom baru
+    try:
+        _conn.execute(f"ALTER TABLE prefs ADD COLUMN {_col}")
+        _conn.commit()
+    except sqlite3.OperationalError:
+        pass
 
 
 def _run(sql, args=()):
@@ -106,13 +107,20 @@ def advance_or_delete(r, now):
 # ---------- preferensi ----------
 def get_prefs(uid):
     _run("INSERT OR IGNORE INTO prefs(uid) VALUES(?)", (uid,))
-    r = _run("SELECT agent, provider, model FROM prefs WHERE uid=?", (uid,)).fetchone()
-    return {"agent": bool(r["agent"]), "provider": r["provider"], "model": r["model"]}
+    r = _run("SELECT agent, provider, model, equity, risk_pct FROM prefs WHERE uid=?",
+             (uid,)).fetchone()
+    return {"agent": bool(r["agent"]), "provider": r["provider"], "model": r["model"],
+            "equity": r["equity"], "risk_pct": r["risk_pct"]}
 
 
 def set_agent(uid, on):
     get_prefs(uid)
     _run("UPDATE prefs SET agent=? WHERE uid=?", (1 if on else 0, uid))
+
+
+def set_risk(uid, equity, risk_pct):
+    get_prefs(uid)
+    _run("UPDATE prefs SET equity=?, risk_pct=? WHERE uid=?", (equity, risk_pct, uid))
 
 
 def set_provider(uid, name, model=None):
@@ -127,7 +135,7 @@ def export_state():
         "facts": [dict(r) for r in _run("SELECT id,uid,fact,ts FROM facts").fetchall()],
         "reminders": [dict(r) for r in _run(
             "SELECT id,uid,chat_id,text,due,repeat FROM reminders").fetchall()],
-        "prefs": [dict(r) for r in _run("SELECT uid,agent,provider,model FROM prefs").fetchall()],
+        "prefs": [dict(r) for r in _run("SELECT uid,agent,provider,model,equity,risk_pct FROM prefs").fetchall()],
     }
 
 
@@ -142,5 +150,6 @@ def import_state(s):
             "INSERT INTO reminders(id,uid,chat_id,text,due,repeat) "
             "VALUES(:id,:uid,:chat_id,:text,:due,:repeat)", s.get("reminders", []))
         _conn.executemany(
-            "INSERT INTO prefs(uid,agent,provider,model) VALUES(:uid,:agent,:provider,:model)",
-            [{"model": None, **p} for p in s.get("prefs", [])])
+            "INSERT INTO prefs(uid,agent,provider,model,equity,risk_pct) "
+            "VALUES(:uid,:agent,:provider,:model,:equity,:risk_pct)",
+            [{"model": None, "equity": None, "risk_pct": None, **p} for p in s.get("prefs", [])])
