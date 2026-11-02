@@ -45,11 +45,21 @@ jobs:
           HOST_MAX_SECONDS: "19800"
         run: |
           set +e
+          echo "t0=$(date +%s)" >> "$GITHUB_OUTPUT"
           python script.py --standby
           echo "code=$?" >> "$GITHUB_OUTPUT"
 
+      # Hanya menyambung bila langkah bot BENAR-BENAR berjalan, selesai karena batas waktu (kode 0),
+      # dan sudah berjalan lama. (Langkah yang dilewati bernilai null, dan null == '0' dianggap benar
+      # oleh GitHub, itu penyebab perulangan sebelumnya.)
       - name: Sambung ke run berikutnya
-        if: steps.bot.outputs.code == '0'
+        if: steps.bot.outcome == 'success' && steps.bot.outputs.code == '0'
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh workflow run standby.yml
+          T0: ${{ steps.bot.outputs.t0 }}
+        run: |
+          if [ $(( $(date +%s) - T0 )) -lt 3600 ]; then
+            echo "Berjalan terlalu singkat, tidak menyambung (cegah perulangan)"
+            exit 0
+          fi
+          gh workflow run standby.yml
