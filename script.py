@@ -1624,8 +1624,11 @@ def github_deploy():
             if st < 300:
                 out.append(f"🗑 {path}")
     if cfg_get("HA_GIST_ID"):
-        out.append(("✓" if set_repo_var("HA_GIST_ID", cfg_get("HA_GIST_ID")) else "⚠️ gagal set")
-                   + " variabel HA_GIST_ID")
+        if set_repo_var("HA_GIST_ID", cfg_get("HA_GIST_ID")):
+            out.append("✓ variabel HA_GIST_ID")
+        else:
+            out.append("⚠️ variabel HA_GIST_ID gagal diset otomatis (token tanpa izin Variables). "
+                       f"Tambahkan manual sebagai secret HA_GIST_ID, isi: {cfg_get('HA_GIST_ID')}")
     cfg_set("DEPLOYED_SHA", hashlib.sha1(src).hexdigest())
     return out, f"https://github.com/{user}/{repo}"
 
@@ -2213,9 +2216,10 @@ async def deploy_cmd(update, ctx):
         return await msg.edit_text(f"⚠️ {e}")
     text = "✅ Selesai\n" + "\n".join(out) + f"\n{url}"
     if ha_enabled():
-        text += ("\n\nMasih perlu 1 langkah manual (sekali saja): di GitHub, Settings → Secrets and "
-                 "variables → Actions → New repository secret, nama GIST_TOKEN, isi sama dengan "
-                 "token gist-mu. Lalu aktifkan: /failover on")
+        text += ("\n\nFailover sudah aktif. Masih perlu langkah manual (sekali saja): di GitHub, "
+                 "Settings → Secrets and variables → Actions → New repository secret, nama "
+                 "GIST_TOKEN, isi sama dengan token gist-mu. Setelah itu tes: hentikan bot di HP "
+                 "dan tunggu notifikasi cadangan GitHub.")
     await msg.edit_text(text)
 
 
@@ -2269,6 +2273,7 @@ async def failover_cmd(update, ctx):
         return delayed_exit(3)
     info = ["Failover: " + ("aktif" if ha_enabled() else "mati")]
     if ha_enabled():
+        info.append(f"Gist ID: {cfg_get('HA_GIST_ID')}")
         try:
             lease = (await asyncio.to_thread(ha_read_all))["lease"]
             age = int(time.time() - lease.get("ts", 0)) if lease.get("ts") else None
