@@ -1341,14 +1341,24 @@ jobs:
           HOST_MAX_SECONDS: "19800"
         run: |
           set +e
+          echo "t0=$(date +%s)" >> "$GITHUB_OUTPUT"
           python script.py --standby
           echo "code=$?" >> "$GITHUB_OUTPUT"
 
+      # Hanya menyambung bila langkah bot BENAR-BENAR berjalan, selesai karena batas waktu (kode 0),
+      # dan sudah berjalan lama. (Langkah yang dilewati bernilai null, dan null == '0' dianggap benar
+      # oleh GitHub, itu penyebab perulangan sebelumnya.)
       - name: Sambung ke run berikutnya
-        if: steps.bot.outputs.code == '0'
+        if: steps.bot.outcome == 'success' && steps.bot.outputs.code == '0'
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh workflow run standby.yml
+          T0: ${{ steps.bot.outputs.t0 }}
+        run: |
+          if [ $(( $(date +%s) - T0 )) -lt 3600 ]; then
+            echo "Berjalan terlalu singkat, tidak menyambung (cegah perulangan)"
+            exit 0
+          fi
+          gh workflow run standby.yml
 """
 
 
@@ -1451,6 +1461,10 @@ def ha_pull_config(text):
     for k, v in data.items():
         if not os.environ.get(k):
             _cfg[k] = v
+    if os.environ.get("GITHUB_ACTIONS") == "true":   # log repo publik: sembunyikan semua nilai rahasia
+        for v in data.values():
+            if isinstance(v, str) and len(v) >= 8:
+                print(f"::add-mask::{v}", flush=True)
     return True
 
 
@@ -2245,6 +2259,7 @@ async def failover_cmd(update, ctx):
             return await update.message.reply_text(
                 "Perlu token Gist dulu. Buat token KLASIK (scope gist saja) di "
                 "github.com/settings/tokens, lalu kirim /setkey gist <token>")
+        wf = None
         try:
             if not cfg_get("HA_GIST_ID"):
                 cfg_set("HA_GIST_ID", await asyncio.to_thread(ha_create))
@@ -2252,11 +2267,13 @@ async def failover_cmd(update, ctx):
             await asyncio.to_thread(ha_write, None, export_state(), "phone", config_blob())
             if gh_configured():
                 await asyncio.to_thread(set_repo_var, "HA_GIST_ID", cfg_get("HA_GIST_ID"))
-                await asyncio.to_thread(gh_workflow, True)
+                wf = await asyncio.to_thread(gh_workflow, True)
         except Exception as e:
             return await update.message.reply_text(f"⚠️ {e}")
+        warn = ("\n⚠️ Workflow GitHub tidak bisa diaktifkan otomatis (token tanpa izin Actions). "
+                "Cek: Actions → standby-bot → Enable workflow.\n") if wf is False else ""
         await update.message.reply_text(
-            "✅ Failover aktif. Bot restart sebentar.\n\nChecklist:\n"
+            "✅ Failover aktif. Bot restart sebentar.\n" + warn + "\nChecklist:\n"
             "1. /github <user> <repo> <token> (jika belum)\n2. /deploy\n"
             "3. Di GitHub: Settings → Secrets and variables → Actions → secret GIST_TOKEN "
             "(isi = token gist)\nSetelah itu HP mati → GitHub mengambil alih otomatis.")
@@ -2267,9 +2284,12 @@ async def failover_cmd(update, ctx):
             await asyncio.to_thread(ha_write, "none")
         except Exception:
             pass
-        if gh_configured():
-            await asyncio.to_thread(gh_workflow, False)
-        await update.message.reply_text("Failover dimatikan (cadangan GitHub dinonaktifkan). Restart sebentar.")
+        wf = await asyncio.to_thread(gh_workflow, False) if gh_configured() else None
+        await update.message.reply_text(
+            "Failover dimatikan di HP. Restart sebentar." + (
+                "\nCadangan GitHub dinonaktifkan." if wf else
+                "\n⚠️ Workflow GitHub belum bisa dinonaktifkan otomatis (token tanpa izin Actions). "
+                "Matikan manual: Actions → standby-bot → ⋯ → Disable workflow."))
         return delayed_exit(3)
     info = ["Failover: " + ("aktif" if ha_enabled() else "mati")]
     if ha_enabled():
