@@ -2,10 +2,15 @@
 """
 Bot Telegram AI hybrid, SATU FILE.
 
-Jalankan:  python script.py
+Jalankan:  python bot.py            -> meluncurkan bot di latar belakang lalu langsung selesai
+Kelola:    python bot.py --status   -> cek apakah bot berjalan
+           python bot.py --log [n]  -> lihat n baris terakhir log (default 30)
+           python bot.py --stop     -> hentikan bot
+           python bot.py --token    -> ganti token bot (hentikan bot dulu)
+           python bot.py --watchdog-on|off|status -> penjaga: hidupkan bot lagi bila mati (Termux:API)
+Debug:     python bot.py --listen   -> jalan di terminal (tanpa melepas diri)
 Semua pengaturan (kunci AI, GitHub, failover) dilakukan lewat Telegram: /setup
-Mode internal (dipakai GitHub Actions): --check, --standby
-Ganti token bot: python script.py --token
+Mode internal: --worker, --check, --standby (GitHub Actions)
 """
 from __future__ import annotations
 
@@ -22,6 +27,9 @@ import operator as op
 import os
 import re
 import secrets
+import shlex
+import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -1640,9 +1648,11 @@ def github_deploy():
     if cfg_get("HA_GIST_ID"):
         if set_repo_var("HA_GIST_ID", cfg_get("HA_GIST_ID")):
             out.append("✓ variabel HA_GIST_ID")
-        else:
-            out.append("⚠️ variabel HA_GIST_ID gagal diset otomatis (token tanpa izin Variables). "
-                       f"Tambahkan manual sebagai secret HA_GIST_ID, isi: {cfg_get('HA_GIST_ID')}")
+        elif not cfg_get("NOTE_VAR"):
+            cfg_set("NOTE_VAR", "1")
+            out.append("ℹ️ Variabel HA_GIST_ID tidak bisa diset otomatis (token tanpa izin Variables). "
+                       "Tidak masalah bila secret HA_GIST_ID sudah kamu isi di GitHub. "
+                       "(Catatan ini hanya muncul sekali.)")
     cfg_set("DEPLOYED_SHA", hashlib.sha1(src).hexdigest())
     return out, f"https://github.com/{user}/{repo}"
 
@@ -1655,7 +1665,8 @@ MAX_FILE_BYTES = 10 * 1024 * 1024
 
 HELP = (
     "🤖 *Bot AI Hybrid*\n\n"
-    "Kirim pesan, foto, atau file (PDF/txt/csv/py) untuk dibaca.\n"
+    "Kirim pesan, foto (satu atau beberapa sekaligus), atau file (PDF/txt/csv/py/JPG/PNG).\n"
+    "Balas jawaban gambar untuk bertanya lagi soal gambarnya.\n"
     "Minta pengingat dengan bahasa biasa, mis. _ingatkan aku 30 menit lagi minum obat_.\n\n"
     "/agent on|off – mode agent (tools) atau chat biasa\n"
     "/models – pilih provider & model AI (tombol)\n"
@@ -1676,8 +1687,10 @@ HELP = (
 
 
 async def send_long(update: Update, text: str):
+    sent = None
     for i in range(0, len(text) or 1, 4000):
-        await update.message.reply_text(text[i:i + 4000])
+        sent = await update.message.reply_text(text[i:i + 4000])
+    return sent
 
 
 async def typing(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1963,6 +1976,12 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "⛔ Kamu tidak diizinkan." if owners() else no_owner_hint())
     uid = update.effective_user.id
     text = update.message.text
+    refs, lost = followup_refs(update, text)
+    if lost:
+        return await update.message.reply_text(
+            "Gambarnya sudah tidak tersimpan (bot sempat dimulai ulang). Kirim ulang fotonya.")
+    if refs:
+        return await answer_images(update, ctx, refs, text, label="[Bertanya soal gambar sebelumnya]")
     p = get_prefs(uid)
     hist = get_history(uid)
     await typing(update, ctx)
@@ -1986,29 +2005,135 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await send_long(update, answer + footer)
 
 
-# ---------------- foto ----------------
-async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not allowed(update):
-        return
+# ---------------- gambar: foto, file gambar, album, dan pertanyaan lanjutan ----------------
+IMG_MIMES = ("image/jpeg", "image/png", "image/webp")
+IMG_EXT_MIME = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp"}
+MAX_ALBUM = 6                      # gambar yang dibaca per permintaan
+MAX_IMG_BYTES = 4_000_000          # per gambar (foto Telegram jarang melebihi ini)
+MAX_TOTAL_BYTES = 12_000_000       # total per permintaan
+ALBUM_WAIT = 1.5                   # detik menunggu foto album lainnya
+FOLLOWUP_WINDOW = 600              # detik: gambar terakhir masih "diingat" untuk teks yang merujuknya
+FOLLOWUP_RE = re.compile(r"\b(gambar|foto|screenshot|tangkapan layar)\b|bagian (kiri|kanan|atas|bawah|tengah|pojok)"
+                         r"|(teks|tulisan) (di|pada|dalam)", re.I)
+DEFAULT_Q = "Jelaskan gambar ini dengan detail."
+DEFAULT_ALBUM_Q = "Jelaskan gambar-gambar ini (berurutan) dan bandingkan bila relevan."
+_img_by_msg = {}                   # (chat_id, id_pesan_bot) -> refs gambar; hilang bila bot dimulai ulang
+_last_imgs = {}                    # uid -> (waktu, refs)
+
+
+def _remember_images(chat_id, uid, sent, refs):
+    _last_imgs[uid] = (time.time(), refs)
+    if sent is not None:
+        _img_by_msg[(chat_id, sent.message_id)] = refs
+        while len(_img_by_msg) > 300:
+            _img_by_msg.pop(next(iter(_img_by_msg)))
+
+
+def _refs_in_message(m):
+    """Gambar yang ada di sebuah pesan Telegram (foto, atau file gambar)."""
+    if m is None:
+        return []
+    if getattr(m, "photo", None):
+        return [{"file_id": m.photo[-1].file_id, "mime": "image/jpeg"}]
+    d = getattr(m, "document", None)
+    if d is not None and (d.mime_type or "").lower() in IMG_MIMES:
+        return [{"file_id": d.file_id, "mime": d.mime_type.lower()}]
+    return []
+
+
+def followup_refs(update, text):
+    """Return (refs, hilang). Gambar untuk pertanyaan lanjutan: dari pesan yang dibalas, atau
+    gambar terakhir (10 menit) bila teksnya jelas merujuk gambar."""
+    r = getattr(update.message, "reply_to_message", None)
+    if r is not None:
+        refs = _refs_in_message(r)
+        if refs:
+            return refs, False
+        known = _img_by_msg.get((update.effective_chat.id, r.message_id))
+        if known:
+            return known, False
+        if " (gambar" in (getattr(r, "text", None) or ""):
+            return None, True                   # membalas jawaban gambar lama yang sudah terlupa
+    last = _last_imgs.get(update.effective_user.id)
+    if last and time.time() - last[0] <= FOLLOWUP_WINDOW and FOLLOWUP_RE.search(text or ""):
+        return last[1], False
+    return None, False
+
+
+async def fetch_images(ctx, refs):
+    parts, total = [], 0
+    for ref in refs[:MAX_ALBUM]:
+        tg_file = await ctx.bot.get_file(ref["file_id"])
+        data = bytes(await tg_file.download_as_bytearray())
+        if len(data) > MAX_IMG_BYTES:
+            raise ValueError("Gambar terlalu besar (maks 4 MB per gambar). Kirim sebagai foto biasa "
+                             "(dikompres Telegram) atau perkecil dulu.")
+        total += len(data)
+        if total > MAX_TOTAL_BYTES:
+            raise ValueError("Total ukuran gambar terlalu besar (maks 12 MB). Kirim lebih sedikit gambar.")
+        parts.append({"type": "image_url", "image_url": {
+            "url": f"data:{ref['mime']};base64,{base64.b64encode(data).decode()}"}})
+    return parts
+
+
+async def answer_images(update, ctx, refs, question, label=None):
     uid = update.effective_user.id
     p = get_prefs(uid)
     await typing(update, ctx)
+    n = min(len(refs), MAX_ALBUM)
+    ask = question + (f" (Terlampir {n} gambar berurutan.)" if n > 1 and question != DEFAULT_ALBUM_Q else "")
     try:
-        tg_file = await update.message.photo[-1].get_file()
-        data = bytes(await tg_file.download_as_bytearray())
-        b64 = base64.b64encode(data).decode()
-        caption = update.message.caption or "Jelaskan gambar ini dengan detail."
-        content = [{"type": "text", "text": caption},
-                   {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}]
+        parts = await fetch_images(ctx, refs)
+        content = [{"type": "text", "text": ask}] + parts
         msgs = [{"role": "system", "content": basic_system(uid)}] + get_history(uid) + [
             {"role": "user", "content": content}]
         answer, used = await router.chat(msgs, p["provider"], vision=True)
-    except Exception as e:
-        logging.exception("foto gagal")
+    except ValueError as e:                       # gambar terlalu besar: pesan jelas, tanpa memanggil AI
         return await update.message.reply_text(f"⚠️ {e}")
-    add_message(uid, "user", f"[Mengirim gambar] {caption}")
+    except Exception as e:
+        logging.exception("gambar gagal")
+        return await update.message.reply_text(f"⚠️ {e}")
+    add_message(uid, "user", f"{label or f'[Mengirim {n} gambar]'} {question}")
     add_message(uid, "assistant", answer)
-    await send_long(update, answer + f"\n\n— {used} (gambar)")
+    foot = f"\n\n— {used} (gambar{' ×' + str(n) if n > 1 else ''})"
+    if len(refs) > MAX_ALBUM:
+        foot += f"\n(Hanya {MAX_ALBUM} gambar pertama yang dibaca.)"
+    foot += "\n↩️ Balas pesan ini untuk bertanya lagi soal gambarnya."
+    sent = await send_long(update, answer + foot)
+    _remember_images(update.effective_chat.id, uid, sent, refs[:MAX_ALBUM])
+
+
+async def flush_album(ctx, gid):
+    await asyncio.sleep(ALBUM_WAIT)
+    a = ctx.application.bot_data.get("albums", {}).pop(gid, None)
+    if not a:
+        return
+    try:
+        await answer_images(a["update"], ctx, a["refs"], a["caption"] or DEFAULT_ALBUM_Q)
+    except Exception:
+        logging.exception("album gagal")
+
+
+async def collect_media(update, ctx, ref):
+    """Satu gambar langsung diproses; gambar dalam satu album dikumpulkan lalu dibaca bersamaan."""
+    msg = update.message
+    gid = msg.media_group_id
+    if not gid:
+        return await answer_images(update, ctx, [ref], msg.caption or DEFAULT_Q)
+    albums = ctx.application.bot_data.setdefault("albums", {})
+    a = albums.get(gid)
+    if a is None:
+        a = albums[gid] = {"refs": [], "caption": "", "update": update}
+        a["task"] = asyncio.create_task(flush_album(ctx, gid))   # simpan rujukan agar tidak dibuang GC
+    a["refs"].append(ref)
+    if msg.caption and not a["caption"]:
+        a["caption"] = msg.caption
+
+
+async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
+        return
+    await collect_media(update, ctx, {"file_id": update.message.photo[-1].file_id, "mime": "image/jpeg"})
 
 
 # ---------------- dokumen ----------------
@@ -2025,6 +2150,15 @@ async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     doc = update.message.document
     name = (doc.file_name or "").lower()
     mime = doc.mime_type or ""
+    if mime.lower() in IMG_MIMES or name.endswith(tuple(IMG_EXT_MIME)):        # gambar yang dikirim sebagai file
+        if doc.file_size and doc.file_size > MAX_IMG_BYTES:
+            return await update.message.reply_text(
+                "Gambar terlalu besar (maks 4 MB). Kirim sebagai foto biasa (dikompres Telegram) atau perkecil dulu.")
+        m_ = mime.lower() if mime.lower() in IMG_MIMES else IMG_EXT_MIME[os.path.splitext(name)[1]]
+        return await collect_media(update, ctx, {"file_id": doc.file_id, "mime": m_})
+    if mime.startswith("image/") or name.endswith((".heic", ".heif", ".gif", ".bmp", ".tif", ".tiff")):
+        return await update.message.reply_text(
+            "Format gambar ini belum didukung. Kirim sebagai foto biasa, atau simpan sebagai JPG, PNG, atau WebP.")
     if doc.file_size and doc.file_size > MAX_FILE_BYTES:
         return await update.message.reply_text("File terlalu besar (maks 10 MB).")
     is_pdf = name.endswith(".pdf") or mime == "application/pdf"
@@ -2155,7 +2289,7 @@ async def setup_cmd(update, ctx):
     lines.append(f"Failover: {'aktif' if ha_enabled() else 'mati'}")
     lines.append(f"Pengguna tambahan: {len(cfg_ids('USER_IDS'))}")
     lines.append("\nPerintah pemilik:\n/setkey /delkey /keys\n/github /deploy /autodeploy\n"
-                 "/failover on|off|status\n/izin <id> /cabut <id>\n/restart")
+                 "/failover on|off|status\n/izin <id> /cabut <id>\n/watchdog /restart /stop")
     await update.message.reply_text("\n".join(lines))
 
 
@@ -2229,11 +2363,11 @@ async def deploy_cmd(update, ctx):
     except Exception as e:
         return await msg.edit_text(f"⚠️ {e}")
     text = "✅ Selesai\n" + "\n".join(out) + f"\n{url}"
-    if ha_enabled():
-        text += ("\n\nFailover sudah aktif. Masih perlu langkah manual (sekali saja): di GitHub, "
-                 "Settings → Secrets and variables → Actions → New repository secret, nama "
-                 "GIST_TOKEN, isi sama dengan token gist-mu. Setelah itu tes: hentikan bot di HP "
-                 "dan tunggu notifikasi cadangan GitHub.")
+    if ha_enabled() and not cfg_get("NOTE_SECRETS"):
+        cfg_set("NOTE_SECRETS", "1")
+        text += ("\n\nFailover aktif. Pastikan di GitHub (Settings → Secrets and variables → Actions) "
+                 "sudah ada secret GIST_TOKEN dan HA_GIST_ID. (Catatan ini hanya muncul sekali; "
+                 "lihat lagi lewat /failover.)")
     await msg.edit_text(text)
 
 
@@ -2300,7 +2434,38 @@ async def failover_cmd(update, ctx):
             info.append(f"Pemegang: {lease.get('holder', '-')}" + (f" ({age} dtk lalu)" if age is not None else ""))
         except Exception as e:
             info.append(f"Gist tidak terjangkau: {e}")
+    info.append("Secret GitHub yang dibutuhkan: GIST_TOKEN dan HA_GIST_ID (secret atau variabel).")
     await update.message.reply_text("\n".join(info) + "\nPakai: /failover on|off")
+
+
+async def watchdog_cmd(update, ctx):
+    """/watchdog on|off|status : penjaga yang menghidupkan bot lagi bila mati (butuh Termux:API)."""
+    if not owner(update):
+        return
+    if NODE_ROLE == "github":
+        return await update.message.reply_text("Penjaga hanya untuk bot di HP.")
+    arg = ctx.args[0].lower() if ctx.args else "status"
+    if arg == "on":
+        msg = (await asyncio.to_thread(wd_install))[1]
+    elif arg == "off":
+        msg = await asyncio.to_thread(wd_remove)
+    else:
+        msg = await asyncio.to_thread(wd_status) + "\nPakai: /watchdog on|off"
+    await update.message.reply_text(msg)
+
+
+async def stop_cmd(update, ctx):
+    if not owner(update):
+        return
+    if NODE_ROLE == "github":
+        return await update.message.reply_text(
+            "Ini node cadangan GitHub. Untuk menonaktifkannya pakai /failover off.")
+    await update.message.reply_text(
+        "⏹ Menghentikan bot. Nyalakan lagi dengan: python bot.py"
+        + (" Sementara itu cadangan GitHub akan mengambil alih." if ha_enabled() else ""))
+    _set_stop_flag("/stop (Telegram)")
+    # SIGTERM ke diri sendiri = shutdown rapi (lease dilepas, state disimpan)
+    asyncio.get_running_loop().call_later(1.5, os.kill, os.getpid(), signal.SIGTERM)
 
 
 async def restart_cmd(update, ctx):
@@ -2412,7 +2577,9 @@ async def post_init(app):
         asyncio.create_task(notify_owners(
             app, "🛰 Cadangan GitHub aktif karena HP tidak terdeteksi. Otomatis kembali saat HP menyala."))
     elif os.environ.get("TGBOT_FIRST") == "1":
-        asyncio.create_task(notify_owners(app, "✅ Bot aktif di HP."))
+        asyncio.create_task(notify_owners(
+            app, "🔁 Bot dihidupkan lagi oleh penjaga setelah sempat mati."
+            if os.environ.get("TGBOT_REVIVED") == "1" else "✅ Bot aktif di HP."))
     app.bot_data["autodeploy_task"] = asyncio.create_task(autodeploy_check(app))
 
 
@@ -2440,7 +2607,7 @@ def run_worker(role):
                      ("claim", claim_cmd), ("setup", setup_cmd), ("setkey", setkey_cmd),
                      ("delkey", delkey_cmd), ("keys", keys_cmd), ("github", github_cmd),
                      ("deploy", deploy_cmd), ("autodeploy", autodeploy_cmd),
-                     ("failover", failover_cmd), ("restart", restart_cmd),
+                     ("failover", failover_cmd), ("restart", restart_cmd), ("stop", stop_cmd), ("watchdog", watchdog_cmd),
                      ("izin", izin_cmd), ("cabut", cabut_cmd)]:
         app.add_handler(CommandHandler(name, fn))
     app.add_handler(CallbackQueryHandler(on_choice))
@@ -2523,35 +2690,366 @@ def first_run_setup():
         print(f"Kirim ke bot di Telegram:  /claim {code}", flush=True)
 
 
-def supervisor():
+# ----------------------------------------------------------------------
+# PROSES LATAR BELAKANG: peluncur (python bot.py) -> pendengar (--listen) -> pekerja (--worker)
+# ----------------------------------------------------------------------
+LOCK_PATH = os.path.join(APP_DIR, "bot.lock")
+PID_PATH = os.path.join(APP_DIR, "bot.pid")
+LOG_PATH = os.path.join(APP_DIR, "bot.log")
+STOP_FLAG = os.path.join(APP_DIR, "stopped")          # ada = dihentikan SENGAJA, penjaga tidak menghidupkan lagi
+WD_SCRIPT = os.path.join(APP_DIR, "watchdog.sh")
+WD_LAST = os.path.join(APP_DIR, "watchdog.last")
+WD_INSTALLED = os.path.join(APP_DIR, "watchdog.installed")
+WD_LOG = os.path.join(APP_DIR, "watchdog.log")
+WD_JOB_ID = "77"
+WD_PERIOD_MS = "900000"                               # 15 menit = batas minimum Android
+_LOCK_FD = None
+_child = None
+_stopping = False
+
+
+def _set_stop_flag(reason):
+    try:
+        with open(STOP_FLAG, "w") as f:
+            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {reason}\n")
+    except OSError:
+        pass
+
+
+def _clear_stop_flag():
+    try:
+        os.remove(STOP_FLAG)
+    except OSError:
+        pass
+
+
+def _try_lock(path):
+    """Kunci eksklusif. Return fd bila berhasil (tidak ada instance lain), None bila sudah dikunci.
+    Kunci otomatis lepas bila prosesnya mati, jadi tidak ada file PID basi yang menipu."""
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except ImportError:                      # Windows
+            import msvcrt
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def _is_running():
+    fd = _try_lock(LOCK_PATH)
+    if fd is None:
+        return True
+    os.close(fd)
+    return False
+
+
+def _read_pid():
+    try:
+        with open(PID_PATH) as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _is_listener(pid):
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return b"--listen" in f.read()
+    except OSError:
+        return True                              # tidak bisa memeriksa: anggap benar
+
+
+def _tail(path, n=30):
+    try:
+        with open(path, "rb") as f:
+            lines = f.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return "(belum ada log)"
+    return "\n".join(lines[-n:]) or "(log kosong)"
+
+
+def show_log(args):
+    n = next((int(x) for x in args if x.isdigit()), 30)
+    print(_tail(LOG_PATH, n))
+    return 0
+
+
+def status_bot():
+    if not _is_running():
+        print("Bot tidak berjalan." + (" (Dihentikan sengaja, penjaga tidak akan menghidupkannya. "
+                                      "Jalankan: python bot.py)" if os.path.exists(STOP_FLAG) else ""))
+        return 1
+    pid = _read_pid()
+    since = ""
+    try:
+        since = ", sejak " + datetime.fromtimestamp(os.path.getmtime(PID_PATH)).strftime("%d-%m %H:%M")
+    except OSError:
+        pass
+    print(f"Bot berjalan di latar belakang (PID {pid}{since}).")
+    return 0
+
+
+def stop_bot():
+    _set_stop_flag("python bot.py --stop")
+    if not _is_running():
+        print("Bot tidak sedang berjalan.")
+        return 0
+    pid = _read_pid()
+    if not pid or not _is_listener(pid):
+        print("PID bot tidak ditemukan. Hentikan manual atau matikan Termux.")
+        return 1
+    try:                                         # seluruh grup proses: pendengar + pekerja
+        os.killpg(os.getpgid(pid), signal.SIGTERM)
+    except (AttributeError, OSError):
+        os.kill(pid, signal.SIGTERM)
+    for _ in range(40):                          # tunggu shutdown rapi (maks 20 dtk)
+        time.sleep(0.5)
+        if not _is_running():
+            print("Bot dihentikan.")
+            return 0
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGKILL)
+    except (AttributeError, OSError):
+        os.kill(pid, signal.SIGKILL)
+    print("Bot dihentikan paksa.")
+    return 0
+
+
+def _on_term(sig, frame):
+    global _stopping
+    _stopping = True
+    if _child is not None and _child.poll() is None:
+        try:
+            _child.send_signal(signal.SIGTERM)
+        except Exception:
+            pass
+
+
+def _log(msg):
+    print(time.strftime("%Y-%m-%d %H:%M:%S"), msg, flush=True)
+
+
+def listen():
+    """Proses sebenarnya (terlepas dari shell). Menjaga bot tetap hidup: restart bila crash."""
+    global _LOCK_FD, _child, _stopping
+    _LOCK_FD = _try_lock(LOCK_PATH)
+    if _LOCK_FD is None:
+        print("Bot sudah berjalan.", flush=True)
+        return
+    with open(PID_PATH, "w") as f:
+        f.write(str(os.getpid()))
     cfg_load()
-    if "--token" in sys.argv:
-        cfg_set("TELEGRAM_BOT_TOKEN", None)
-    ensure_deps()
-    first_run_setup()
+    signal.signal(signal.SIGTERM, _on_term)
+    if hasattr(signal, "SIGHUP"):
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)          # terminal ditutup: abaikan
+    first = "1"
+    _log("pendengar mulai")
+    while not _stopping:
+        env = {**os.environ, "TGBOT_FIRST": first, "PYTHONUNBUFFERED": "1"}
+        _child = subprocess.Popen([sys.executable, SELF_PATH, "--worker"], env=env)
+        try:
+            rc = _child.wait()
+        except KeyboardInterrupt:                 # --listen dijalankan di terminal lalu CTRL+C
+            _stopping = True
+            _set_stop_flag("CTRL+C")
+            try:
+                _child.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                _child.kill()
+            break
+        first = "0"
+        if rc == 2:
+            _set_stop_flag("konfigurasi fatal (kode 2)")
+        if _stopping or rc in (0, 2, 130, -2, -15):  # berhenti normal / konfigurasi fatal / dihentikan
+            _log(f"bot berhenti (kode {rc}), pendengar selesai")
+            break
+        if rc == 3:                               # /restart
+            continue
+        _log(f"bot berhenti (kode {rc}), mulai ulang 10 detik lagi")
+        for _ in range(20):
+            if _stopping:
+                break
+            time.sleep(0.5)
+    try:
+        os.remove(PID_PATH)
+    except OSError:
+        pass
+
+
+def _spawn_listener(revived=False):
+    """Luncurkan pendengar terpisah (terlepas dari sesi). Dipakai peluncur dan penjaga."""
     try:
         subprocess.run(["termux-wake-lock"], capture_output=True)   # Termux: cegah HP tidur
     except Exception:
         pass
-    first = "1"
-    while True:
-        env = {**os.environ, "TGBOT_FIRST": first}
-        p = subprocess.Popen([sys.executable, SELF_PATH, "--worker"], env=env)
+    try:                                           # putar log bila sudah besar
+        if os.path.getsize(LOG_PATH) > 1_000_000:
+            os.replace(LOG_PATH, LOG_PATH + ".1")
+    except OSError:
+        pass
+    env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+    if revived:
+        env["TGBOT_REVIVED"] = "1"
+    kw = {"creationflags": 0x00000008 | 0x00000200} if os.name == "nt" else {"start_new_session": True}
+    with open(LOG_PATH, "ab") as log:
+        return subprocess.Popen([sys.executable, SELF_PATH, "--listen"],
+                                stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                                close_fds=True, cwd=os.path.dirname(SELF_PATH) or None, env=env, **kw)
+
+
+# ---------------- penjaga (watchdog): hidupkan bot lagi bila mati ----------------
+def _wlog(msg):
+    print(time.strftime("%Y-%m-%d %H:%M:%S"), "[penjaga]", msg, flush=True)
+
+
+def _read_float(path):
+    try:
+        with open(path) as f:
+            return float(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def watchdog_run():
+    """Dipanggil terjadwal oleh termux-job-scheduler (python bot.py --watchdog). Aman dijalankan berulang."""
+    try:
+        if os.path.getsize(WD_LOG) > 200_000:
+            with open(WD_LOG, "r+b") as f:        # kosongkan tanpa memutus pengalihan keluaran
+                f.truncate(0)
+    except OSError:
+        pass
+    with open(WD_LAST, "w") as f:                  # detak: bukti job benar-benar berjalan
+        f.write(str(time.time()))
+    if _is_running():
+        return 0
+    if os.path.exists(STOP_FLAG):
+        _wlog("bot mati tetapi dihentikan sengaja, dibiarkan")
+        return 0
+    cfg_load()
+    if not cfg_get("TELEGRAM_BOT_TOKEN"):
+        _wlog("token bot belum ada, tidak dimulai")
+        return 2
+    _wlog("bot mati -> dimulai ulang oleh penjaga")
+    p = _spawn_listener(revived=True)
+    time.sleep(1)
+    rc = p.poll()
+    if rc not in (None, 0):
+        _wlog(f"gagal start (kode {rc})")
+        return 1
+    return 0
+
+
+def _tjs(*args, timeout=25):
+    exe = shutil.which("termux-job-scheduler")
+    if not exe:
+        return None, "NOT_FOUND"
+    try:
+        r = subprocess.run([exe, *args], capture_output=True, text=True, timeout=timeout,
+                           stdin=subprocess.DEVNULL)
+        return r.returncode, (r.stdout + r.stderr).strip()
+    except subprocess.TimeoutExpired:
+        return None, "TIMEOUT"
+
+
+def wd_install():
+    """Return (berhasil, pesan)."""
+    if not shutil.which("termux-job-scheduler"):
+        return False, ("termux-job-scheduler tidak ditemukan. Pasang aplikasi Termux:API (dari sumber yang sama "
+                       "dengan Termux), lalu jalankan di Termux: pkg install termux-api")
+    shebang = shutil.which("bash") or "/system/bin/sh"
+    script = (f"#!{shebang}\n"
+              f"export HOME={shlex.quote(os.path.expanduser('~'))}\n"
+              f"export PATH={shlex.quote(os.environ.get('PATH', ''))}\n"
+              f"export TGBOT_HOME={shlex.quote(APP_DIR)}\n"
+              f"exec {shlex.quote(sys.executable)} {shlex.quote(SELF_PATH)} --watchdog "
+              f">> {shlex.quote(WD_LOG)} 2>&1\n")
+    fd = os.open(WD_SCRIPT, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o700)
+    with os.fdopen(fd, "w") as f:
+        f.write(script)
+    base = ["--script", WD_SCRIPT, "--job-id", WD_JOB_ID, "--period-ms", WD_PERIOD_MS, "--network", "any"]
+    rc, out = _tjs(*base, "--persisted", "true")
+    persisted = True
+    if rc != 0 and out != "TIMEOUT":                # versi lama tanpa --persisted: coba tanpa
+        rc, out = _tjs(*base)
+        persisted = False
+    if out == "TIMEOUT":
+        return False, ("termux-job-scheduler tidak merespons dalam 25 detik (kendala yang dikenal di sebagian "
+                       "versi Termux:API). Coba lagi, atau perbarui Termux:API.")
+    if rc != 0 or "response 1" not in out.lower():
+        return False, f"Gagal menjadwalkan: {out[:200] or 'tanpa keterangan'}"
+    with open(WD_INSTALLED, "w") as f:
+        f.write(str(time.time()))
+    return True, ("✅ Penjaga dijadwalkan: dicek tiap ±15 menit (batas Android; bisa tertunda)."
+                  + ("" if persisted else "\n⚠️ Versi Termux:API-mu tidak mendukung --persisted: job hilang "
+                                          "setelah HP restart, jadwalkan ulang lewat /watchdog on.")
+                  + "\nBuktikan jalan: tunggu ±30 menit lalu kirim /watchdog (lihat 'terakhir berjalan').")
+
+
+def wd_remove():
+    rc, out = _tjs("--cancel", "--job-id", WD_JOB_ID)
+    for p in (WD_INSTALLED, WD_LAST):
         try:
-            rc = p.wait()
-        except KeyboardInterrupt:       # biarkan anak selesai merapikan diri
-            try:
-                p.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                p.kill()
-            break
-        first = "0"
-        if rc in (0, 2, 130, -2):       # berhenti normal / Ctrl+C / konfigurasi fatal
-            break
-        if rc == 3:                      # /restart
-            continue
-        print(f"Bot berhenti (kode {rc}), mulai ulang 10 detik lagi...", flush=True)
-        time.sleep(10)
+            os.remove(p)
+        except OSError:
+            pass
+    if out == "NOT_FOUND":
+        return "termux-job-scheduler tidak ditemukan (Termux:API belum terpasang)."
+    if out == "TIMEOUT":
+        return "termux-job-scheduler tidak merespons. Job mungkin masih terdaftar; coba lagi."
+    return "🗑 Penjaga dimatikan."
+
+
+def wd_status():
+    now = time.time()
+    installed, last = _read_float(WD_INSTALLED), _read_float(WD_LAST)
+    rc, out = _tjs("--pending", timeout=15)
+    if out == "NOT_FOUND":
+        reg = "tidak tersedia (Termux:API belum terpasang)"
+    elif out == "TIMEOUT":
+        reg = "tidak bisa membaca daftar job (termux-job-scheduler tidak merespons)"
+    else:
+        reg = "terdaftar" if WD_SCRIPT in out else "tidak terdaftar"
+    lines = [f"Penjaga: {reg}",
+             f"Bot: {'berjalan' if _is_running() else 'tidak berjalan'}"]
+    if last:
+        lines.append(f"Terakhir berjalan: {int((now - last) / 60)} menit lalu")
+    else:
+        lines.append("Terakhir berjalan: belum pernah")
+    if reg == "terdaftar" and installed:
+        if (last is None or last < installed) and now - installed > 2400:
+            lines.append("⚠️ Terdaftar tetapi belum pernah berjalan setelah 40 menit. Android mungkin menahannya: "
+                         "matikan penghemat baterai untuk Termux dan Termux:API.")
+        elif last and now - last > 2700:
+            lines.append("⚠️ Seharusnya jalan tiap ±15 menit, tetapi sudah lama tidak. Cek penghemat baterai.")
+    if os.path.exists(STOP_FLAG):
+        lines.append("Dihentikan sengaja: ya (penjaga tidak akan menghidupkan; jalankan python bot.py)")
+    return "\n".join(lines)
+
+
+def launch():
+    """python bot.py: siapkan, luncurkan pendengar terpisah, cetak satu baris, selesai."""
+    cfg_load()
+    if _is_running():
+        print("Bot sudah berjalan di latar belakang.")
+        return 0
+    if "--token" in sys.argv:
+        cfg_set("TELEGRAM_BOT_TOKEN", None)
+    ensure_deps()
+    first_run_setup()
+    _clear_stop_flag()                             # start manual = hapus tanda "dihentikan sengaja"
+    p = _spawn_listener()
+    time.sleep(1)                                  # deteksi crash seketika (mis. izin/Python rusak)
+    rc = p.poll()
+    if rc not in (None, 0):
+        print(f"❌ Bot gagal dijalankan (kode {rc}). Log terakhir:\n{_tail(LOG_PATH, 15)}")
+        return 1
+    print("Bot berjalan di latar belakang...")
+    return 0
 
 
 def main():
@@ -2562,8 +3060,26 @@ def main():
         run_worker("github")
     elif "--worker" in a:
         run_worker("phone")
+    elif "--listen" in a:
+        listen()
+    elif "--stop" in a:
+        sys.exit(stop_bot())
+    elif "--status" in a:
+        sys.exit(status_bot())
+    elif "--log" in a:
+        sys.exit(show_log(a))
+    elif "--watchdog" in a:
+        sys.exit(watchdog_run())
+    elif "--watchdog-on" in a:
+        ok, msg = wd_install()
+        print(msg)
+        sys.exit(0 if ok else 1)
+    elif "--watchdog-off" in a:
+        print(wd_remove())
+    elif "--watchdog-status" in a:
+        print(wd_status())
     else:
-        supervisor()
+        sys.exit(launch())
 
 
 if __name__ == "__main__":
