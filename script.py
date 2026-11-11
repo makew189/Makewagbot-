@@ -31,11 +31,13 @@ import shlex
 import shutil
 import signal
 import sqlite3
+import struct
 import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
+import zlib
 from datetime import datetime, timedelta, timezone
 from urllib.parse import parse_qs, urlparse
 
@@ -422,6 +424,43 @@ PROVIDERS = [
 COOLDOWN = 60  # detik provider "istirahat" setelah gagal
 
 
+def _errtxt(e):
+    """Teks galat yang selalu informatif (galat timeout httpx kosong bila dicetak apa adanya)."""
+    if isinstance(e, RuntimeError):
+        return str(e) or "galat tak dikenal"
+    if isinstance(e, asyncio.TimeoutError):
+        return "timeout"
+    return f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
+
+
+def _reply_text(r):
+    """Ambil teks jawaban dari respons chat/completions, dengan pesan galat yang jelas."""
+    if r.status_code != 200:
+        raise RuntimeError(f"HTTP {r.status_code}: {r.text[:100]}")
+    try:
+        data = r.json()
+    except ValueError:
+        raise RuntimeError(f"balasan bukan JSON (HTTP {r.status_code}): {r.text[:80]!r}")
+    try:
+        text = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError):
+        raise RuntimeError(f"format balasan tak dikenal: {str(data)[:100]}")
+    if not text:
+        raise RuntimeError("respons kosong")
+    return text, data
+
+
+def _tiny_png_b64():
+    """Gambar PNG merah 32x32 (dibuat di tempat, hanya stdlib) untuk menguji dukungan gambar."""
+    def chunk(t, d):
+        return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xFFFFFFFF)
+    w = h = 32
+    raw = b"".join(b"\x00" + b"\xff\x00\x00" * w for _ in range(h))
+    png = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+           + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+    return base64.b64encode(png).decode()
+
+
 class Router:
     def __init__(self):
         self.providers = []
@@ -483,6 +522,27 @@ class Router:
                     return i
         return ids[0] if ids else None
 
+    async def probe(self, p, vision=False, timeout=30):
+        """Uji satu provider apa adanya (tanpa fallback, tidak mengubah status istirahat).
+        Return (berhasil, detik, keterangan)."""
+        t0 = time.time()
+        if vision:
+            content = [{"type": "text", "text": "Gambar ini warna apa? Jawab satu kata."},
+                       {"type": "image_url", "image_url": {"url": "data:image/png;base64," + _tiny_png_b64()}}]
+        else:
+            content = "Balas hanya dengan satu kata: OK"
+        try:
+            r = await asyncio.wait_for(self.client.post(
+                p["base"].rstrip("/") + "/chat/completions",
+                headers={"Authorization": f"Bearer {p['api_key']}"},
+                json={"model": p["model"], "messages": [{"role": "user", "content": content}]}), timeout)
+            text, _ = _reply_text(r)
+            return True, time.time() - t0, text.strip()[:30]
+        except asyncio.TimeoutError:
+            return False, time.time() - t0, f"timeout >{timeout} dtk"
+        except Exception as e:
+            return False, time.time() - t0, _errtxt(e)[:110]
+
     async def chat(self, messages, prefer=None, temperature=0.4, vision=False, model=None):
         if not self.providers:
             raise RuntimeError("Belum ada kunci AI. Kirim /setkey groq <kunci> "
@@ -496,9 +556,8 @@ class Router:
             order.sort(key=lambda p: p["name"] != prefer)
         now = time.time()
         errors = []
-        for p in order:
-            if p["down_until"] > now and p["name"] != prefer:
-                continue
+        usable = [p for p in order if p["down_until"] <= now or p["name"] == prefer]
+        for p in (usable or order):        # semua sedang "istirahat"? tetap coba, jangan gagal kosong
             # model pilihan pengguna hanya berlaku untuk provider pilihannya
             override = model if (model and not vision and p["name"] == prefer) else None
             for attempt in (1, 2):
@@ -511,7 +570,9 @@ class Router:
                     )
                     if r.status_code != 200:
                         # model hilang/dihapus -> cari model pengganti, coba lagi
-                        if (r.status_code in (400, 404, 410) and attempt == 1 and not override
+                        # 400 pada permintaan gambar biasanya soal gambarnya, bukan modelnya: jangan ganti model
+                        if ((r.status_code in (404, 410) or (r.status_code == 400 and not vision))
+                                and attempt == 1 and not override
                                 and not p["pinned"] and not p.get("no_discovery")):
                             new = await self._discover(p, avoid=p["model"])
                             if new:
@@ -520,18 +581,15 @@ class Router:
                                 p["model"] = new
                                 continue
                         raise RuntimeError(f"HTTP {r.status_code}: {r.text[:100]}")
-                    data = r.json()
-                    text = data["choices"][0]["message"]["content"]
-                    if not text:
-                        raise RuntimeError("respons kosong")
+                    text, data = _reply_text(r)
                     # nama model yang benar-benar dipakai (router seperti OpenRouter bisa memilih sendiri)
                     used_model = data.get("model") or override or p["model"]
                     return text.strip(), f"{p['name']} · {used_model}"
                 except Exception as e:
-                    log.warning("%s gagal: %s", p["name"], e)
+                    log.warning("%s gagal: %s", p["name"], _errtxt(e))
                     p["down_until"] = time.time() + COOLDOWN
                     errors.append(f"{p['name']}"
-                                  f"{' (' + override + ')' if override else ''}: {str(e)[:120]}")
+                                  f"{' (' + override + ')' if override else ''}: {_errtxt(e)[:120]}")
                     break
         raise RuntimeError("Semua provider gagal:\n" + "\n".join(errors))
 
@@ -2289,7 +2347,7 @@ async def setup_cmd(update, ctx):
     lines.append(f"Failover: {'aktif' if ha_enabled() else 'mati'}")
     lines.append(f"Pengguna tambahan: {len(cfg_ids('USER_IDS'))}")
     lines.append("\nPerintah pemilik:\n/setkey /delkey /keys\n/github /deploy /autodeploy\n"
-                 "/failover on|off|status\n/izin <id> /cabut <id>\n/watchdog /restart /stop")
+                 "/failover on|off|status\n/izin <id> /cabut <id>\n/tes /watchdog /restart /stop")
     await update.message.reply_text("\n".join(lines))
 
 
@@ -2468,6 +2526,31 @@ async def stop_cmd(update, ctx):
     asyncio.get_running_loop().call_later(1.5, os.kill, os.getpid(), signal.SIGTERM)
 
 
+async def tes_cmd(update, ctx):
+    """/tes : uji tiap provider AI (teks dan gambar) dan tampilkan kecepatan serta galatnya."""
+    if not owner(update):
+        return
+    ps = list(router.providers)
+    if not ps:
+        return await update.message.reply_text("Belum ada kunci AI. Lihat /setup")
+    msg = await update.message.reply_text(f"🧪 Menguji {len(ps)} provider (maks ±30 detik)...")
+
+    def fmt(res):
+        ok, sec, note = res
+        return f"✅ {sec:.1f}s" if ok else f"❌ {note}"
+
+    async def one(p):
+        jobs = [router.probe(p)] + ([router.probe(p, vision=True)] if p.get("vision") else [])
+        res = await asyncio.gather(*jobs)
+        icon = "🟢" if all(r[0] for r in res) else ("🔴" if not any(r[0] for r in res) else "🟠")
+        line = f"{icon} {p['name']} ({p['model']}): teks {fmt(res[0])}"
+        if len(res) > 1:
+            line += f"\n    gambar {fmt(res[1])}"
+        return line
+    lines = await asyncio.gather(*[one(p) for p in ps])
+    await msg.edit_text("🧪 Hasil uji provider\n" + "\n".join(lines))
+
+
 async def restart_cmd(update, ctx):
     if not owner(update):
         return
@@ -2607,7 +2690,7 @@ def run_worker(role):
                      ("claim", claim_cmd), ("setup", setup_cmd), ("setkey", setkey_cmd),
                      ("delkey", delkey_cmd), ("keys", keys_cmd), ("github", github_cmd),
                      ("deploy", deploy_cmd), ("autodeploy", autodeploy_cmd),
-                     ("failover", failover_cmd), ("restart", restart_cmd), ("stop", stop_cmd), ("watchdog", watchdog_cmd),
+                     ("failover", failover_cmd), ("restart", restart_cmd), ("tes", tes_cmd), ("stop", stop_cmd), ("watchdog", watchdog_cmd),
                      ("izin", izin_cmd), ("cabut", cabut_cmd)]:
         app.add_handler(CommandHandler(name, fn))
     app.add_handler(CallbackQueryHandler(on_choice))
