@@ -415,12 +415,14 @@ PROVIDERS = [
      "prefer": ["mistral-small", "mistral-medium", "open-mistral"]},
     {"name": "github", "base": "https://models.github.ai/inference",
      "key": "GITHUB_TOKEN", "model": "openai/gpt-4o-mini", "no_discovery": True,
-     "vision": True},
+     "vision": True,
+     "headers": {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}},
     {"name": "nvidia", "base": "https://integrate.api.nvidia.com/v1",
      "key": "NVIDIA_API_KEY", "model": "openai/gpt-oss-120b",
      "prefer": ["gpt-oss-120b", "llama-3.1-70b", "llama", "qwen", "deepseek"]},
 ]
 
+RETRY_503_WAIT = 2.0   # detik: coba sekali lagi bila provider kelebihan beban sesaat (503)
 COOLDOWN = 60  # detik provider "istirahat" setelah gagal
 
 
@@ -440,7 +442,8 @@ def _reply_text(r):
     try:
         data = r.json()
     except ValueError:
-        raise RuntimeError(f"balasan bukan JSON (HTTP {r.status_code}): {r.text[:80]!r}")
+        ctype = (getattr(r, "headers", None) or {}).get("content-type", "?")
+        raise RuntimeError(f"balasan bukan JSON (HTTP {r.status_code}, {ctype}): {r.text[:80]!r}")
     try:
         text = data["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError):
@@ -513,9 +516,14 @@ class Router:
         p = next((x for x in self.providers if x["name"] == name), None)
         return await self._list_ids(p) if p else []
 
+    @staticmethod
+    def _headers(p):
+        return {"Authorization": f"Bearer {p['api_key']}", **p.get("headers", {})}
+
     async def _discover(self, p, avoid=None):
-        """Pilih otomatis model chat pengganti."""
-        ids = [i for i in await self._list_ids(p) if i != avoid]
+        """Pilih otomatis model chat pengganti (melewati model yang sudah dicoba)."""
+        skip = {avoid} if isinstance(avoid, str) else set(avoid or ())
+        ids = [i for i in await self._list_ids(p) if i not in skip]
         for pref in p.get("prefer", []):
             for i in ids:
                 if pref in i.lower():
@@ -524,6 +532,7 @@ class Router:
 
     async def probe(self, p, vision=False, timeout=30):
         """Uji satu provider apa adanya (tanpa fallback, tidak mengubah status istirahat).
+        Bila modelnya sudah dihapus (404/410), cari penggantinya (maks 3 kali) dan simpan.
         Return (berhasil, detik, keterangan)."""
         t0 = time.time()
         if vision:
@@ -531,17 +540,25 @@ class Router:
                        {"type": "image_url", "image_url": {"url": "data:image/png;base64," + _tiny_png_b64()}}]
         else:
             content = "Balas hanya dengan satu kata: OK"
-        try:
-            r = await asyncio.wait_for(self.client.post(
-                p["base"].rstrip("/") + "/chat/completions",
-                headers={"Authorization": f"Bearer {p['api_key']}"},
-                json={"model": p["model"], "messages": [{"role": "user", "content": content}]}), timeout)
-            text, _ = _reply_text(r)
-            return True, time.time() - t0, text.strip()[:30]
-        except asyncio.TimeoutError:
-            return False, time.time() - t0, f"timeout >{timeout} dtk"
-        except Exception as e:
-            return False, time.time() - t0, _errtxt(e)[:110]
+        tried = {p["model"]}
+        for attempt in (1, 2, 3):
+            try:
+                r = await asyncio.wait_for(self.client.post(
+                    p["base"].rstrip("/") + "/chat/completions", headers=self._headers(p),
+                    json={"model": p["model"], "messages": [{"role": "user", "content": content}]}), timeout)
+                if (r.status_code in (404, 410) and attempt < 3
+                        and not p["pinned"] and not p.get("no_discovery")):
+                    new = await self._discover(p, avoid=tried)
+                    if new:
+                        tried.add(new)
+                        p["model"] = new
+                        continue
+                text, _ = _reply_text(r)
+                return True, time.time() - t0, text.strip()[:30]
+            except asyncio.TimeoutError:
+                return False, time.time() - t0, f"timeout >{timeout} dtk"
+            except Exception as e:
+                return False, time.time() - t0, _errtxt(e)[:110]
 
     async def chat(self, messages, prefer=None, temperature=0.4, vision=False, model=None):
         if not self.providers:
@@ -560,24 +577,30 @@ class Router:
         for p in (usable or order):        # semua sedang "istirahat"? tetap coba, jangan gagal kosong
             # model pilihan pengguna hanya berlaku untuk provider pilihannya
             override = model if (model and not vision and p["name"] == prefer) else None
-            for attempt in (1, 2):
+            tried, waited = {p["model"]}, False
+            for attempt in (1, 2, 3):
                 try:
                     r = await self.client.post(
                         p["base"].rstrip("/") + "/chat/completions",
-                        headers={"Authorization": f"Bearer {p['api_key']}"},
+                        headers=self._headers(p),
                         json={"model": override or p["model"], "messages": messages,
                               "temperature": temperature},
                     )
                     if r.status_code != 200:
+                        if r.status_code == 503 and not waited and attempt < 3:   # kelebihan beban sesaat
+                            waited = True
+                            await asyncio.sleep(RETRY_503_WAIT)
+                            continue
                         # model hilang/dihapus -> cari model pengganti, coba lagi
                         # 400 pada permintaan gambar biasanya soal gambarnya, bukan modelnya: jangan ganti model
                         if ((r.status_code in (404, 410) or (r.status_code == 400 and not vision))
-                                and attempt == 1 and not override
+                                and attempt < 3 and not override
                                 and not p["pinned"] and not p.get("no_discovery")):
-                            new = await self._discover(p, avoid=p["model"])
+                            new = await self._discover(p, avoid=tried)
                             if new:
                                 log.info("%s: model diganti %s -> %s",
                                          p["name"], p["model"], new)
+                                tried.add(new)
                                 p["model"] = new
                                 continue
                         raise RuntimeError(f"HTTP {r.status_code}: {r.text[:100]}")
@@ -2533,19 +2556,24 @@ async def tes_cmd(update, ctx):
     ps = list(router.providers)
     if not ps:
         return await update.message.reply_text("Belum ada kunci AI. Lihat /setup")
-    msg = await update.message.reply_text(f"🧪 Menguji {len(ps)} provider (maks ±30 detik)...")
+    msg = await update.message.reply_text(f"🧪 Menguji {len(ps)} provider (±1 menit)...")
 
     def fmt(res):
         ok, sec, note = res
         return f"✅ {sec:.1f}s" if ok else f"❌ {note}"
 
     async def one(p):
-        jobs = [router.probe(p)] + ([router.probe(p, vision=True)] if p.get("vision") else [])
-        res = await asyncio.gather(*jobs)
+        old = p["model"]
+        res = [await router.probe(p)]
+        if p.get("vision"):
+            await asyncio.sleep(1.1)               # sebagian provider gratis hanya 1 permintaan/detik
+            res.append(await router.probe(p, vision=True))
         icon = "🟢" if all(r[0] for r in res) else ("🔴" if not any(r[0] for r in res) else "🟠")
         line = f"{icon} {p['name']} ({p['model']}): teks {fmt(res[0])}"
         if len(res) > 1:
             line += f"\n    gambar {fmt(res[1])}"
+        if p["model"] != old:
+            line += f"\n    🔄 model lama dihapus penyedia, diganti otomatis: {old} → {p['model']}"
         return line
     lines = await asyncio.gather(*[one(p) for p in ps])
     await msg.edit_text("🧪 Hasil uji provider\n" + "\n".join(lines))
